@@ -20,6 +20,8 @@ use threadpool::ThreadPool;
 use ureq::Response;
 use zip::ZipArchive;
 
+const USER_AGENT: &str = "modpacklauncher/202207271710-0f9644f5fc-release Mozilla/5.0 (LINUX) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.138 Safari/537.36 Vivaldi/1.8.770.56";
+
 fn main() {
     let mut args = env::args();
     let firstArg = args.nth(1).expect("Invalid usage (consider \"help\")");
@@ -204,6 +206,16 @@ fn getFTBServerURL(id: &String, version: &String) -> String {
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn getFTBServerURL(id: &String, version: &String) -> String {
     format!("https://api.modpacks.ch/public/modpack/{}/{}/server/arm/linux", id, version)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn getFTBServerURL(id: &String, version: &String) -> String {
+    format!("https://api.modpacks.ch/public/modpack/{}/{}/server/arm/mac", id, version)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+fn getFTBServerURL(id: &String, version: &String) -> String {
+    format!("https://api.modpacks.ch/public/modpack/{}/{}/server/mac", id, version)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -404,7 +416,7 @@ fn downloadPack(id: &String, mut version: String, packType: PackType, threads: u
     let url = packType.url().to_owned() + &id + "/" + &version;
     
     let manifestResp = ureq::get(&url)
-        .set("User-Agent", "curl/7.83.1") // API returns empty url otherwise
+        .set("User-Agent", USER_AGENT) // API returns empty url otherwise
         .call()
         .map_err(|it| format!("Failed to get modpack version manifest: {:?}", it))?;
     let decoded = manifestResp.into_string()
