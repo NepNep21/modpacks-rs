@@ -5,9 +5,10 @@ use std::{
     collections::HashMap, 
     io::{Read, Write, self}, 
     fs::{create_dir_all, File}, 
-    sync::mpsc::{self, Sender}, 
+    sync::{mpsc::{self, Sender}, Arc, Mutex}, 
     path::PathBuf, 
-    process::Command
+    process::Command, 
+    time::Duration
 };
 
 #[cfg(not(windows))]
@@ -423,11 +424,11 @@ fn downloadPack(id: &String, mut version: String, packType: PackType, threads: u
         .map_err(|it| format!("Failed to parse modpack version manifest as string: {:?}", it))?;
     let parsed = json::parse(&decoded)
         .map_err(|it| format!("Failed to parse modpack version manifest as json: {:?}", it))?;
-    let mut pool: Option<ThreadPool> = None;
+    let mut pool: Option<Arc<Mutex<ThreadPool>>> = None;
     let files = parsed["files"].members();
-    let (send, recv) = mpsc::channel::<String>();
+    let (send, recv) = mpsc::channel::<Option<(ModpackFile, String)>>();
     if threads > 1 {
-        pool = Some(ThreadPool::new(threads));
+        pool = Some(Arc::new(Mutex::new(ThreadPool::new(threads))));
     }
     match pool {
         Some(pool) => {
@@ -438,17 +439,37 @@ fn downloadPack(id: &String, mut version: String, packType: PackType, threads: u
                 let file = file.clone();
                 let id = id.clone();
                 let send = send.clone();
-                pool.execute(move || downloadFileThreaded(file, &id, send));
+                let clone = Arc::clone(&pool);
+                pool.lock().unwrap().execute(move || downloadFileThreaded(ModpackFile::new(file), &id, send, clone));
             }
-            drop(send); // Drops the original sender to prevent infinite waiting when the threads exit, the clone can still send messages
-            recv.recv().expect_err("Failed to download files");
-            pool.join();
+            while let Some(Some((failed, error))) = recv.recv().ok() { // mmm
+                let sendClone = send.clone();
+                if failed.failureCount < 6 {
+                    let id = id.clone();
+                    println!("Retrying failed download");
+                    let clone = Arc::clone(&pool);
+                    pool.lock().unwrap().execute(move || downloadFileThreaded(failed, &id, sendClone, clone));
+                } else {
+                    return Err(format!("Failed to download files: {:?}", error));
+                }
+            }
+            // Hacky but oh well
+            let mut notEmpty = true;
+            while notEmpty {
+                if let Ok(pool) = pool.try_lock() {
+                    if pool.queued_count() + pool.active_count() == 0 {
+                        notEmpty = false;
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            let pool = pool.lock().unwrap();
+            pool.join(); // Sanity check
         }
         None => {
             for file in files {
-                if let Err(error) = downloadFile(file.clone(), &id) {
-                    return Err(error);
-                }
+                handleFile(ModpackFile::new(file.clone()), id)?;
             }
         }
     }
@@ -517,10 +538,50 @@ fn downloadPack(id: &String, mut version: String, packType: PackType, threads: u
     Ok(())
 }
 
-fn downloadFileThreaded(file: JsonValue, id: &String, channel: Sender<String>) {
-    if let Err(error) = downloadFile(file, id) {
-        channel.send(error.clone()).expect(&format!("Failed to send error message: {}", error));
+#[derive(Clone)]
+struct ModpackFile {
+    pub file: JsonValue,
+    pub failureCount: u8
+}
+
+impl ModpackFile {
+    pub fn new(file: JsonValue) -> Self {
+        Self { file, failureCount: 0 }
     }
+}
+
+fn handleFile(mut file: ModpackFile, id: &String) -> Result<(), String> {
+    let result = maybeDownloadFile(&mut file, id);
+    if result.is_err() {
+        if file.failureCount < 6 {
+            println!("Retrying failed download");
+            return handleFile(file, id);
+        } else {
+            return result;
+        }
+    }
+    Ok(())
+}
+
+fn downloadFileThreaded(mut file: ModpackFile, id: &String, channel: Sender<Option<(ModpackFile, String)>>, pool: Arc<Mutex<ThreadPool>>) {
+    if let Err(error) = maybeDownloadFile(&mut file, id) {
+        channel.send(Some((file, error.clone()))).expect(&format!("Failed to send error message: {}", error));
+    } else {
+        let pool = pool.lock().unwrap();
+        let count = pool.queued_count() + pool.active_count();
+        if count > 1 {
+            return;
+        }
+        channel.send(None).expect("Failed to cancel loop");
+    }
+}
+
+fn maybeDownloadFile(file: &mut ModpackFile, id: &String) -> Result<(), String> {
+    let result = downloadFile(file.file.clone(), id);
+    if result.is_err() {
+        file.failureCount += 1;
+    }
+    return result;
 }
 
 fn downloadFile(file: JsonValue, id: &String) -> Result<(), String> {
